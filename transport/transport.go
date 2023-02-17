@@ -35,7 +35,7 @@ type ConnDelegate interface {
 }
 
 type Conn interface {
-	Close()
+	Close() error
 	SetDelegate(delegate ConnDelegate)
 	Id() connid.Id
 	WriteBuffers(buffers net.Buffers) (n int, err error)
@@ -76,7 +76,7 @@ var (
 	TimeoutErr = errors.New("time out")
 )
 
-func (c *Transport) Send(ctx context.Context, data []byte, timeout time.Duration) (res []byte, err error) {
+func (c *Transport) Send(ctx context.Context, data net.Buffers, timeout time.Duration) (res []byte, err error) {
 	timer := time.NewTimer(timeout)
 	_, logger := log.WithCtx(c.ctx)
 
@@ -100,7 +100,11 @@ func (c *Transport) Send(ctx context.Context, data []byte, timeout time.Duration
 	return
 }
 
-func (c *Transport) sendOnce(ctx context.Context, data []byte, timer *time.Timer) (res []byte, err error) {
+func (c *Transport) Context() context.Context {
+	return c.ctx
+}
+
+func (c *Transport) sendOnce(ctx context.Context, data net.Buffers, timer *time.Timer) (res []byte, err error) {
 
 	_, logger := log.WithCtx(c.ctx)
 
@@ -114,10 +118,10 @@ func (c *Transport) sendOnce(ctx context.Context, data []byte, timer *time.Timer
 	resCh := make(chan []byte)
 	seq := c.addChan(resCh)
 
-	buffers := make([][]byte, 2)
+	buffers := make([][]byte, 1, 1 + len(data))
 	buffers[0] = make([]byte, sequenceLen)
 	binary.BigEndian.PutUint32(buffers[0], seq)
-	buffers[1] = data
+	buffers = append(buffers, data...)
 
 	_, err = c.conn.WriteBuffers(buffers)
 	if err != nil {
@@ -189,7 +193,7 @@ func (c *Transport) close(oldId connid.Id) {
 		return
 	}
 
-	c.conn.Close()
+	_ = c.conn.Close()
 	close(c.connClosed)
 	c.conn = nil
 }
