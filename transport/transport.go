@@ -1,15 +1,15 @@
 package transport
 
 import (
-  "context"
-  "encoding/binary"
-  "errors"
-  "fmt"
-  "github.com/xpwu/go-log/log"
-  "github.com/xpwu/go-xnet/xtcp"
-  "net"
-  "sync"
-  "time"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"github.com/xpwu/go-log/log"
+	"github.com/xpwu/go-xnet/connid"
+	"net"
+	"sync"
+	"time"
 )
 
 /**
@@ -29,183 +29,203 @@ protocol:
 
 const sequenceLen = 4
 
+type ConnDelegate interface {
+	OnReceived(data []byte)
+	OnClosed(id connid.Id)
+}
+
 type Conn interface {
-  Connect(addr string)
-  Close()
-  SetOnReceived(func([]byte))
-  WriteBuffers(buffers net.Buffers) (n int, err error)
+	Close()
+	SetDelegate(delegate ConnDelegate)
+	Id() connid.Id
+	WriteBuffers(buffers net.Buffers) (n int, err error)
+}
+
+type Connector interface {
+	Connect(ctx context.Context, addr string) (conn Conn, err error)
 }
 
 type Transport struct {
-  conn       Conn
-  connClosed chan struct{}
-  mutex      sync.RWMutex
-  addr       string
-  ctx        context.Context
+	connector  Connector
+	conn       Conn
+	connClosed chan struct{}
+	mutex      sync.RWMutex
+	addr       string
+	ctx        context.Context
 
-  mq       map[uint32] chan []byte
-  sequence uint32
-  mqMu     sync.Mutex
+	mq       map[uint32]chan []byte
+	sequence uint32
+	mqMu     sync.Mutex
+}
+
+func New(ctx context.Context, connector Connector, addr string) *Transport {
+	return &Transport{
+		connector:  connector,
+		conn:       nil,
+		connClosed: nil,
+		mutex:      sync.RWMutex{},
+		addr:       addr,
+		ctx:        ctx,
+		mq:         make(map[uint32]chan []byte),
+		sequence:   0,
+		mqMu:       sync.Mutex{},
+	}
 }
 
 var (
-  Err = errors.New("time out")
+	TimeoutErr = errors.New("time out")
 )
 
 func (c *Transport) Send(ctx context.Context, data []byte, timeout time.Duration) (res []byte, err error) {
-  timer := time.NewTimer(timeout)
-  _, logger := log.WithCtx(c.ctx)
-  //logger.PushPrefix(fmt.Sprintf("push to conn(token=%s). ", token))
+	timer := time.NewTimer(timeout)
+	_, logger := log.WithCtx(c.ctx)
 
-  res, err = c.sendOnce(ctx, data, timer)
-  if err == Err {
-    return
-  }
-  if err == nil {
-    if !timer.Stop() {
-      <-timer.C
-    }
-    return
-  }
+	res, err = c.sendOnce(ctx, data, timer)
+	if err == TimeoutErr {
+		return
+	}
+	if err == nil {
+		if !timer.Stop() {
+			<-timer.C
+		}
+		return
+	}
 
-  // 非超时情况，重试一次。需要重试的原因主要是可能在发送的时候，连接断了
-  logger.PushPrefix("try again, ")
-  res, err = c.sendOnce(ctx, data, timer)
-  if err != Err && !timer.Stop() {
-    <-timer.C
-  }
-  return
+	// 非超时情况，重试一次。需要重试的原因主要是可能在发送的时候，连接断了
+	logger.PushPrefix("try again,")
+	res, err = c.sendOnce(ctx, data, timer)
+	if err != TimeoutErr && !timer.Stop() {
+		<-timer.C
+	}
+	return
 }
 
 func (c *Transport) sendOnce(ctx context.Context, data []byte, timer *time.Timer) (res []byte, err error) {
 
-  _, logger := log.WithCtx(c.ctx)
+	_, logger := log.WithCtx(c.ctx)
 
-  conn, connClosed, err := c.connect()
-  if err != nil {
-    logger.Error(err)
-    return nil, err
-  }
-  logger.PushPrefix(fmt.Sprintf("connid=%s", conn.Id().String()))
+	thisId, err := c.connect()
+	if err != nil {
+		logger.Error(err)
+		return nil, err
+	}
+	logger.PushPrefix(fmt.Sprintf("connid=%s", thisId.String()))
 
-  resCh := make(chan []byte)
-  seq := c.addChan(resCh)
+	resCh := make(chan []byte)
+	seq := c.addChan(resCh)
 
-  buffers := make([][]byte, 2)
-  buffers[0] = make([]byte, sequenceLen)
-  binary.BigEndian.PutUint32(buffers[0], seq)
-  buffers[1] = data
+	buffers := make([][]byte, 2)
+	buffers[0] = make([]byte, sequenceLen)
+	binary.BigEndian.PutUint32(buffers[0], seq)
+	buffers[1] = data
 
-  _, err = conn.WriteBuffers(buffers)
-  if err != nil {
-    logger.Error(err)
-    c.delChan(seq)
-    c.close(conn, connClosed)
-    return
-  }
+	_, err = c.conn.WriteBuffers(buffers)
+	if err != nil {
+		logger.Error(err)
+		c.delChan(seq)
+		c.close(thisId)
+		return
+	}
 
-  select {
-  case res = <-resCh:
-    return
+	select {
+	case res = <-resCh:
+		return
 
-  case <-connClosed:
-    err = errors.New("connection closed")
-  case <-timer.C:
-    err = Err
-  case <-ctx.Done():
-    err = ctx.Err()
-  case <-c.ctx.Done():
-    err = c.ctx.Err()
-  }
-  c.delChan(seq)
-  return
+	case <-c.connClosed:
+		err = errors.New("connection closed")
+	case <-timer.C:
+		err = TimeoutErr
+	case <-ctx.Done():
+		err = ctx.Err()
+	case <-c.ctx.Done():
+		err = c.ctx.Err()
+	}
+	c.delChan(seq)
+	return
 }
 
-func (c *Transport) connect() (conn Conn, connClosed chan struct{}, err error) {
+func (c *Transport) connect() (id connid.Id, err error) {
 
- c.mutex.RLock()
- if c.conn != nil {
-   ret := c.conn
-   ch := c.connClosed
-   c.mutex.RUnlock()
-   return ret, ch, nil
- }
- c.mutex.RUnlock()
+	c.mutex.RLock()
+	if c.conn != nil {
+		id = c.conn.Id()
+		c.mutex.RUnlock()
+		return
+	}
+	c.mutex.RUnlock()
 
- c.mutex.Lock()
- defer c.mutex.Unlock()
- // read again
- if c.conn != nil {
-   return c.conn, c.connClosed, nil
- }
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	// read again
+	if c.conn != nil {
+		return c.conn.Id(), nil
+	}
 
- ctx, logger := log.WithCtx(c.ctx)
- logger.PushPrefix("connecting... ")
+	ctx, logger := log.WithCtx(c.ctx)
+	logger.PushPrefix("connecting...")
 
- conn, err := xtcp.Dial(ctx, "tcp", c.addr)
- if err != nil {
-   logger.Error(err)
-   return nil, nil, err
- }
- logger.PopPrefix()
+	conn, err := c.connector.Connect(ctx, c.addr)
+	if err != nil {
+		logger.Error(err)
+		return 0, err
+	}
+	logger.PopPrefix()
 
- c.conn = xtcp.NewConn(ctx, conn)
- c.connClosed = make(chan struct{})
+	c.conn = conn
+	c.connClosed = make(chan struct{})
 
- logger.Debug(fmt.Sprintf("connected(id:%s), ", c.conn.Id()))
+	logger.Debug(fmt.Sprintf("connected(id:%s), ", c.conn.Id()))
 
- c.read(c.conn, c.connClosed)
+	c.conn.SetDelegate(c)
 
- return c.conn, c.connClosed, nil
+	return c.conn.Id(), nil
 }
 
-func (c *Transport) close(old *xtcp.Conn, connClosed chan struct{}) {
- c.mutex.RLock()
- // 已有新的连接时，不做任何操作
- if c.conn == nil || old.Id() != c.conn.Id() {
-   c.mutex.RUnlock()
-   return
- }
+func (c *Transport) close(oldId connid.Id) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	// 已有新的连接时，说明已经关闭过了，不做任何操作
+	if c.conn == nil || oldId != c.conn.Id() {
+		return
+	}
 
- c.mutex.RUnlock()
-
- c.mutex.Lock()
- defer c.mutex.Unlock()
-
- _ = c.conn.Close()
- close(connClosed)
-
- c.conn = nil
+	c.conn.Close()
+	close(c.connClosed)
+	c.conn = nil
 }
 
 func (c *Transport) delChan(sequence uint32) (r chan []byte, ok bool) {
-  c.mqMu.Lock()
-  defer c.mqMu.Unlock()
+	c.mqMu.Lock()
+	defer c.mqMu.Unlock()
 
-  r, ok = c.mq[sequence]
-  delete(c.mq, sequence)
+	r, ok = c.mq[sequence]
+	delete(c.mq, sequence)
 
-  return
+	return
 }
 
 func (c *Transport) addChan(ch chan []byte) uint32 {
-  c.mqMu.Lock()
-  defer c.mqMu.Unlock()
-  c.sequence++
-  c.mq[c.sequence] = ch
+	c.mqMu.Lock()
+	defer c.mqMu.Unlock()
+	c.sequence++
+	c.mq[c.sequence] = ch
 
-  return c.sequence
+	return c.sequence
 }
 
-func (c *Transport) onReceived(data []byte) {
-  _, logger := log.WithCtx(c.ctx)
-  seq := binary.BigEndian.Uint32(data)
-  rc, ok := c.delChan(seq)
-  if !ok {
-    logger.Warning(fmt.Sprintf("not find request of reqid(%d)", seq))
-    return
-  }
+func (c *Transport) OnReceived(data []byte) {
+	_, logger := log.WithCtx(c.ctx)
+	seq := binary.BigEndian.Uint32(data)
+	rc, ok := c.delChan(seq)
+	if !ok {
+		logger.Warning(fmt.Sprintf("not find request of reqid(%d)", seq))
+		return
+	}
 
-  rc <- data[4:]
-  close(rc)
+	rc <- data[4:]
+	close(rc)
+}
+
+func (c *Transport) OnClosed(id connid.Id) {
+	c.close(id)
 }
