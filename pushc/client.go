@@ -1,222 +1,115 @@
 package pushc
 
 import (
-  "context"
-  "errors"
-  "fmt"
-  "github.com/xpwu/go-log/log"
-  "github.com/xpwu/go-stream/push/protocol"
-  "github.com/xpwu/go-xnet/xtcp"
-  "sync"
-  "time"
+	"context"
+	"encoding/binary"
+	"fmt"
+	"github.com/xpwu/go-log/log"
+	"github.com/xpwu/go-stream/push/core"
+	"github.com/xpwu/go-stream/push/protocol"
+	"github.com/xpwu/go-streamclient/transport"
+	"github.com/xpwu/go-xnet/xtcp"
+	"sync"
+	"time"
 )
 
-type client struct {
-  conn       *xtcp.Conn
-  connClosed chan struct{}
-  mutex      sync.RWMutex
-  addr       string
-  ctx        context.Context
+type conn struct {
+	*xtcp.Conn
+	delegate transport.ConnDelegate
+}
 
-  mq       map[uint32]chan *protocol.Response
-  sequence uint32
-  mqMu     sync.Mutex
+func (c *conn) SetDelegate(delegate transport.ConnDelegate) {
+	c.delegate = delegate
+}
+
+type connector struct {
+}
+
+func (c *connector) Connect(ctx context.Context, addr string) (conn transport.Conn, err error) {
+
+}
+
+type client struct {
+	transport *transport.Transport
 }
 
 var (
-  timeoutE = errors.New("time out")
-
-  clients = sync.Map{}
+	clients = sync.Map{}
 )
 
 func sendTo(ctx context.Context, addr string, data []byte, token string, subP byte,
-  timeout time.Duration) (res *protocol.Response, err error) {
+	timeout time.Duration) (res *protocol.Response, err error) {
 
-  actual, loaded := clients.LoadOrStore(addr, &client{
-    conn:       nil,
-    connClosed: nil,
-    mutex:      sync.RWMutex{},
-    addr:       addr,
-    mq:         make(map[uint32]chan *protocol.Response),
-    sequence:   0,
-    mqMu:       sync.Mutex{},
-  })
-  c := actual.(*client)
-  if !loaded {
-    cctx, logger := log.WithCtx(context.TODO())
-    c.ctx = cctx
-    logger.PushPrefix(fmt.Sprintf("push client(connect to %s).", addr))
-  }
+	// 链接的ctx 与 请求的ctx 不是同一个
+	cctx, logger := log.WithCtx(context.TODO())
+	logger.PushPrefix(fmt.Sprintf("push client(connect to %s).", addr))
 
-  return c.send(ctx, data, token, subP, timeout)
+	actual,_ := clients.LoadOrStore(addr, &client{
+		transport: transport.New(cctx, &connector{}, addr),
+	})
+	c := actual.(*client)
+
+	return c.send(ctx, data, token, subP, timeout)
 }
 
-func (c *client) send(ctx context.Context, data []byte, token string, subP byte, timeout time.Duration) (res *protocol.Response, err error) {
-  timer := time.NewTimer(timeout)
-  _, logger := log.WithCtx(c.ctx)
-  logger.PushPrefix(fmt.Sprintf("push to conn(token=%s). ", token))
+/**
+	Request:
+   token | subprotocol | len | <data>
+     sizeof(token) = 32 . hex
+     sizeof(subprotocol) = 1.
+     sizeof(len) = 4. len = sizof(data) net order
+     data: subprotocol Request data
 
-  res, err = c.sendOnce(ctx, data, token, subP, timer)
-  if err == timeoutE || err == nil || ctx.Err() != nil {
-    if err != timeoutE && !timer.Stop() {
-      <-timer.C
-    }
-    return
-  }
+  Response:
+   state | len | <data>
+     sizeof(state) = 1.
+               state = 0: success; 1: hostname error
+                ; 2: token not exist; 3: server intelnal error
+     sizeof(len) = 4. len = sizeof(data) net order
+     data: subprotocol Response data
+*/
 
-  // 非超时情况，重试一次。需要重试的原因主要是可能在发送的时候，连接断了
-  logger.PushPrefix("try again, ")
-  res, err = c.sendOnce(ctx, data, token, subP, timer)
-  if err != timeoutE && !timer.Stop() {
-    <-timer.C
-  }
-  return
-}
+func (c *client) send(ctx context.Context, data []byte, token string, subP byte,
+	timeout time.Duration) (res *protocol.Response, err error) {
 
-func (c *client) sendOnce(ctx context.Context, data []byte, token string, subP byte,
-  timer *time.Timer) (res *protocol.Response, err error) {
+	if len(token) != core.TokenLen {
+		return nil, fmt.Errorf("token len must be %d", core.TokenLen)
+	}
 
-  _, logger := log.WithCtx(c.ctx)
+	buffer := make([][]byte, 3)
+	buffer[0] = []byte(token)
+	buffer[1] = make([]byte, 5)
+	buffer[1][0] = subP
+	binary.BigEndian.PutUint32(buffer[2][1:], uint32(len(data)))
+	buffer[2] = data
 
-  conn, connClosed, err := c.connect()
-  if err != nil {
-    logger.Error(err)
-    return nil, err
-  }
-  logger.PushPrefix(fmt.Sprintf("connid=%s", conn.Id().String()))
-
-  resCh := make(chan *protocol.Response)
-  seq := c.addChan(resCh)
-
-  r := protocol.NewRequest(conn)
-  r.SetSequence(seq)
-  r.Data = data
-  r.Token = []byte(token)
-  r.SubProtocol = subP
-
-  err = r.Write()
-  if err != nil {
-    logger.Error(err)
-    c.popChan(seq)
-    c.close(conn, connClosed)
-    return
-  }
-
-  select {
-  case res = <-resCh:
-    return
-    
-  case <-connClosed:
-    err = errors.New("connection closed")
-  case <-timer.C:
-    err = timeoutE
-  case <-ctx.Done():
-    err = ctx.Err()
-  case <-c.ctx.Done():
-    err = c.ctx.Err()
-  }
-  c.popChan(seq)
-  return
-}
-
-func (c *client) connect() (xConn *xtcp.Conn, connClosed chan struct{}, err error) {
-
-  c.mutex.RLock()
-  if c.conn != nil {
-    ret := c.conn
-    ch := c.connClosed
-    c.mutex.RUnlock()
-    return ret, ch, nil
-  }
-  c.mutex.RUnlock()
-
-  c.mutex.Lock()
-  defer c.mutex.Unlock()
-  // read again
-  if c.conn != nil {
-    return c.conn, c.connClosed, nil
-  }
-
-  ctx, logger := log.WithCtx(c.ctx)
-  logger.PushPrefix("connecting... ")
-
-  conn, err := xtcp.Dial(ctx, "tcp", c.addr)
-  if err != nil {
-    logger.Error(err)
-    return nil, nil, err
-  }
-  logger.PopPrefix()
-
-  c.conn = xtcp.NewConn(ctx, conn)
-  c.connClosed = make(chan struct{})
-
-  logger.Debug(fmt.Sprintf("connected(id:%s), ", c.conn.Id()))
-
-  c.read(c.conn, c.connClosed)
-
-  return c.conn, c.connClosed, nil
-}
-
-func (c *client) close(old *xtcp.Conn, connClosed chan struct{}) {
-  c.mutex.RLock()
-  // 已有新的连接时，不做任何操作
-  if c.conn == nil || old.Id() != c.conn.Id() {
-    c.mutex.RUnlock()
-    return
-  }
-
-  c.mutex.RUnlock()
-
-  c.mutex.Lock()
-  defer c.mutex.Unlock()
-
-  _ = c.conn.Close()
-  close(connClosed)
-
-  c.conn = nil
-}
-
-func (c *client) popChan(sequence uint32) (r chan *protocol.Response, ok bool) {
-  c.mqMu.Lock()
-  defer c.mqMu.Unlock()
-
-  r, ok = c.mq[sequence]
-  delete(c.mq, sequence)
-
-  return
-}
-
-func (c *client) addChan(ch chan *protocol.Response) uint32 {
-  c.mqMu.Lock()
-  defer c.mqMu.Unlock()
-  c.sequence++
-  c.mq[c.sequence] = ch
-
-  return c.sequence
+	resD, err := c.transport.Send(ctx, buffer, timeout)
+	// todo parse resD
+	// todo PushPrefix(fmt.Sprintf("push to conn(token=%s). ", token))
 }
 
 func (c *client) read(conn *xtcp.Conn, connClosed chan struct{}) {
-  _, logger := log.WithCtx(c.ctx)
-  logger.PushPrefix(fmt.Sprintf("read response from conn(id=%s),", conn.Id().String()))
-  go func() {
-    for {
-      logger.Debug("read... ")
-      r, err := protocol.NewResByConn(conn, time.Time{})
-      if err != nil {
-        logger.Error(err)
-        logger.Info("close connect " + conn.Id().String())
-        c.close(conn, connClosed)
-        break
-      }
+	_, logger := log.WithCtx(c.ctx)
+	logger.PushPrefix(fmt.Sprintf("read response from conn(id=%s),", conn.Id().String()))
+	go func() {
+		for {
+			logger.Debug("read... ")
+			r, err := protocol.NewResByConn(conn, time.Time{})
+			if err != nil {
+				logger.Error(err)
+				logger.Info("close connect " + conn.Id().String())
+				c.close(conn, connClosed)
+				break
+			}
 
-      rc, ok := c.popChan(r.R.GetSequence())
-      if !ok {
-        logger.Warning(fmt.Sprintf("not find request of reqid(%d)", r.R.GetSequence()))
-        continue
-      }
+			rc, ok := c.popChan(r.R.GetSequence())
+			if !ok {
+				logger.Warning(fmt.Sprintf("not find request of reqid(%d)", r.R.GetSequence()))
+				continue
+			}
 
-      rc <- r
-      close(rc)
-    }
-  }()
+			rc <- r
+			close(rc)
+		}
+	}()
 }
