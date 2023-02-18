@@ -82,6 +82,11 @@ func PushData(ctx context.Context, pushUrl string, data []byte, timeout time.Dur
   ctx, logger := log.WithCtx(ctx)
 
   logger.PushPrefix(fmt.Sprintf("push data(len=%d) to %s,", len(data), pushUrl))
+  // 控制大小  默认1M
+  if len(data) > 1*1024*1024 {
+    log.Error("data's length must be less than 1MB")
+    return errors.New("data's length must be less than 1MB")
+  }
 
   logger.Info("start. ")
   err := send(ctx, pushUrl, dataSubProtocolId, data, timeout)
