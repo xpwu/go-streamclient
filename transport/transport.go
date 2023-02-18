@@ -78,7 +78,7 @@ var (
 
 func (c *Transport) Send(ctx context.Context, data net.Buffers, timeout time.Duration) (res []byte, err error) {
 	timer := time.NewTimer(timeout)
-	_, logger := log.WithCtx(c.ctx)
+	_, logger := log.WithCtx(ctx)
 
 	res, err = c.sendOnce(ctx, data, timer)
 	if err == TimeoutErr {
@@ -106,14 +106,17 @@ func (c *Transport) Context() context.Context {
 
 func (c *Transport) sendOnce(ctx context.Context, data net.Buffers, timer *time.Timer) (res []byte, err error) {
 
-	_, logger := log.WithCtx(c.ctx)
+	_, tLogger := log.WithCtx(c.ctx)
+	ctx, logger := log.WithCtx(ctx)
 
 	thisId, err := c.connect()
 	if err != nil {
-		logger.Error(err)
+		tLogger.Error(err)
 		return nil, err
 	}
-	logger.PushPrefix(fmt.Sprintf("connid=%s", thisId.String()))
+	idLStr := fmt.Sprintf("connid=%s", thisId.String())
+	tLogger.PushPrefix(idLStr)
+	logger.PushPrefix(idLStr)
 
 	resCh := make(chan []byte)
 	seq := c.addChan(resCh)
@@ -125,6 +128,7 @@ func (c *Transport) sendOnce(ctx context.Context, data net.Buffers, timer *time.
 
 	_, err = c.conn.WriteBuffers(buffers)
 	if err != nil {
+		tLogger.Error(err)
 		logger.Error(err)
 		c.delChan(seq)
 		c.close(thisId)
@@ -133,6 +137,7 @@ func (c *Transport) sendOnce(ctx context.Context, data net.Buffers, timer *time.
 
 	select {
 	case res = <-resCh:
+		logger.Debug("succeed")
 		return
 
 	case <-c.connClosed:
@@ -145,6 +150,7 @@ func (c *Transport) sendOnce(ctx context.Context, data net.Buffers, timer *time.
 		err = c.ctx.Err()
 	}
 	c.delChan(seq)
+	logger.Error(err)
 	return
 }
 

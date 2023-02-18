@@ -49,7 +49,7 @@ func send(ctx context.Context, pushUrl string, sub byte, data []byte, timeout ti
 
   logger.Debug("token:" + token)
 
-  res, err := sendTo(ctx, url, data, token, sub, timeout)
+  res, err := SendTo(ctx, url, data, token, sub, timeout)
   if err != nil {
     return err
   }

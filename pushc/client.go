@@ -1,55 +1,46 @@
 package pushc
 
 import (
-	"context"
-	"encoding/binary"
+  "context"
+  "encoding/binary"
+	"errors"
 	"fmt"
-	"github.com/xpwu/go-log/log"
-	"github.com/xpwu/go-stream/push/core"
-	"github.com/xpwu/go-stream/push/protocol"
-	"github.com/xpwu/go-streamclient/transport"
-	"github.com/xpwu/go-xnet/xtcp"
-	"sync"
-	"time"
+  "github.com/xpwu/go-log/log"
+  "github.com/xpwu/go-stream/push/core"
+  "github.com/xpwu/go-streamclient/transport"
+  "net"
+  "sync"
+  "time"
 )
 
-type conn struct {
-	*xtcp.Conn
-	delegate transport.ConnDelegate
-}
-
-func (c *conn) SetDelegate(delegate transport.ConnDelegate) {
-	c.delegate = delegate
-}
-
-type connector struct {
-}
-
-func (c *connector) Connect(ctx context.Context, addr string) (conn transport.Conn, err error) {
-
-}
-
-type client struct {
-	transport *transport.Transport
+type Client struct {
+  transport *transport.Transport
 }
 
 var (
-	clients = sync.Map{}
+  clients = sync.Map{}
 )
 
-func sendTo(ctx context.Context, addr string, data []byte, token string, subP byte,
-	timeout time.Duration) (res *protocol.Response, err error) {
-
-	// 链接的ctx 与 请求的ctx 不是同一个
-	cctx, logger := log.WithCtx(context.TODO())
+func New(ctx context.Context, addr string) *Client {
+	// 连接的ctx 与 请求的ctx 不是同一个
+	ctx, logger := log.WithCtx(ctx)
 	logger.PushPrefix(fmt.Sprintf("push client(connect to %s).", addr))
 
-	actual,_ := clients.LoadOrStore(addr, &client{
-		transport: transport.New(cctx, &connector{}, addr),
-	})
-	c := actual.(*client)
+	return &Client{
+		transport: transport.New(ctx, &connector{}, addr),
+	}
+}
 
-	return c.send(ctx, data, token, subP, timeout)
+func SendTo(ctx context.Context, addr string, data []byte, token string, subP byte,
+  timeout time.Duration) (res *Response, err error) {
+
+	c, ok := clients.Load(addr)
+	if !ok {
+		// 链接的ctx 与 请求的ctx 不是同一个
+		c, _ = clients.LoadOrStore(addr, New(context.TODO(), addr))
+	}
+	client := c.(*Client)
+	return client.Send(ctx, data, token, subP, timeout)
 }
 
 /**
@@ -61,55 +52,47 @@ func sendTo(ctx context.Context, addr string, data []byte, token string, subP by
      data: subprotocol Request data
 
   Response:
-   state | len | <data>
-     sizeof(state) = 1.
-               state = 0: success; 1: hostname error
-                ; 2: token not exist; 3: server intelnal error
-     sizeof(len) = 4. len = sizeof(data) net order
-     data: subprotocol Response data
+   state
+    sizeof(state) = 1.
+    state = 0: success;         1: hostname error;
+            2: token not exist; 3: server intelnal error;
+            4: timeout
 */
 
-func (c *client) send(ctx context.Context, data []byte, token string, subP byte,
-	timeout time.Duration) (res *protocol.Response, err error) {
+func request(data []byte, token string, subP byte) net.Buffers {
+  buffer := make([][]byte, 3)
+  buffer[0] = []byte(token)
+  buffer[1] = make([]byte, 5)
+  buffer[1][0] = subP
+  binary.BigEndian.PutUint32(buffer[2][1:], uint32(len(data)))
+  buffer[2] = data
 
-	if len(token) != core.TokenLen {
-		return nil, fmt.Errorf("token len must be %d", core.TokenLen)
-	}
-
-	buffer := make([][]byte, 3)
-	buffer[0] = []byte(token)
-	buffer[1] = make([]byte, 5)
-	buffer[1][0] = subP
-	binary.BigEndian.PutUint32(buffer[2][1:], uint32(len(data)))
-	buffer[2] = data
-
-	resD, err := c.transport.Send(ctx, buffer, timeout)
-	// todo parse resD
-	// todo PushPrefix(fmt.Sprintf("push to conn(token=%s). ", token))
+  return buffer
 }
 
-func (c *client) read(conn *xtcp.Conn, connClosed chan struct{}) {
-	_, logger := log.WithCtx(c.ctx)
-	logger.PushPrefix(fmt.Sprintf("read response from conn(id=%s),", conn.Id().String()))
-	go func() {
-		for {
-			logger.Debug("read... ")
-			r, err := protocol.NewResByConn(conn, time.Time{})
-			if err != nil {
-				logger.Error(err)
-				logger.Info("close connect " + conn.Id().String())
-				c.close(conn, connClosed)
-				break
-			}
+type Response struct {
+  State core.State
+}
 
-			rc, ok := c.popChan(r.R.GetSequence())
-			if !ok {
-				logger.Warning(fmt.Sprintf("not find request of reqid(%d)", r.R.GetSequence()))
-				continue
-			}
+func (c *Client) Send(ctx context.Context, data []byte, token string, subP byte,
+  timeout time.Duration) (res *Response, err error) {
 
-			rc <- r
-			close(rc)
-		}
-	}()
+  ctx, logger := log.WithCtx(ctx)
+  logger.PushPrefix(fmt.Sprintf("push token=%s.", token))
+
+  if len(token) != core.TokenLen {
+		str := fmt.Sprintf("token len must be %d", core.TokenLen)
+    logger.Error(str)
+    return nil, errors.New(str)
+  }
+
+  resD, err := c.transport.Send(ctx, request(data, token, subP), timeout)
+  if len(resD) != 1 {
+    return nil, errors.New("transport.Send(): return data err, len must be 1")
+  }
+  if err != nil {
+    return nil, err
+  }
+
+  return &Response{State: core.State(resD[0])}, nil
 }
