@@ -19,6 +19,10 @@ func (c *conn) SetDelegate(delegate transport.ConnDelegate) {
   c.delegate = delegate
 }
 
+func (c *conn) MaxConcurrent() int  {
+  return 5
+}
+
 type connector struct {
 }
 

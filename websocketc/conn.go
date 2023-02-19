@@ -22,7 +22,7 @@ type conn struct {
   ctx      context.Context
   once     sync.Once
 
-  concurrent chan struct{}
+  concurrent int
   maxBytes   uint32
 }
 
@@ -52,7 +52,7 @@ func newConn(ctx context.Context, c *websocket.Conn) *conn {
     delegate: nil,
     id:       id,
     ctx:      ctx,
-    maxBytes: 4*1024*1024, // 4M
+    maxBytes: 4 * 1024 * 1024, // 4M
   }
 }
 
@@ -65,7 +65,10 @@ func (c *conn) Close() (err error) {
   return
 }
 
-// todo concurrent  maxBytes
+func (c *conn) MaxConcurrent() int  {
+  return c.concurrent
+}
+
 func (c *conn) WriteBuffers(buffers net.Buffers) (n int, err error) {
   // 只能一个goroutines 访问
   c.mu <- struct{}{}
@@ -84,6 +87,14 @@ func (c *conn) WriteBuffers(buffers net.Buffers) (n int, err error) {
   }
 
   l := 0
+  for _, d := range buffers {
+    l += len(d)
+  }
+  if uint32(l) > c.maxBytes {
+    return 0, fmt.Errorf("the data of this frame is too large, must be less than %d Bytes", c.maxBytes)
+  }
+
+  l = 0
   for _, d := range buffers {
     l += len(d)
     if _, err = writer.Write(d); err != nil {
@@ -120,7 +131,7 @@ func (c *conn) readHandshake() (peerConnectionID connid.Id, err error) {
     return 0, fmt.Errorf("len(handshake) should be 16, actual %d", len(m))
   }
   m = m[3:] // ignore HeartBeat_s  FrameTimeout_s
-  c.concurrent = make(chan struct{}, int(m[0]))
+  c.concurrent = int(m[0])
   m = m[1:]
   c.maxBytes = binary.BigEndian.Uint32(m[0:])
   m = m[4:]
@@ -164,7 +175,7 @@ func (c *connector) Connect(ctx context.Context, addr string) (ret transport.Con
 
   connect := newConn(ctx, wConn)
   logger.Debug("read handshake")
-  cid,err := connect.readHandshake()
+  cid, err := connect.readHandshake()
   if err != nil {
     logger.Error(err)
     return nil, err
