@@ -70,6 +70,10 @@ func newConnSuits(conn Conn, concurrent int) *connSuit {
   }
 }
 
+type Delegate interface {
+  UnknownSeq(seq uint32, data []byte)
+}
+
 type Transport struct {
   connector Connector
   addr      string
@@ -82,12 +86,12 @@ type Transport struct {
   sequence uint32
   mqMu     sync.Mutex
 
-  opt *option
+  Delegate Delegate
+  opt      *option
 }
 
 type option struct {
-  start      uint32
-  unknownSeq func(seq uint32, data []byte)
+  start uint32
 }
 
 type Option func(opt *option)
@@ -98,16 +102,9 @@ func StartSeq(start uint32) Option {
   }
 }
 
-func UnknownSeq(f func(seq uint32, data []byte)) Option {
-  return func(opt *option) {
-    opt.unknownSeq = f
-  }
-}
-
 func New(ctx context.Context, connector Connector, addr string, options ...Option) *Transport {
   opt := &option{
-    start:      0,
-    unknownSeq: nil,
+    start: 0,
   }
   for _, v := range options {
     v(opt)
@@ -125,7 +122,8 @@ func New(ctx context.Context, connector Connector, addr string, options ...Optio
     sequence: 10,
     mqMu:     sync.Mutex{},
 
-    opt: opt,
+    Delegate: nil,
+    opt:      opt,
   }
 }
 
@@ -176,7 +174,7 @@ func (c *Transport) sendOnce(ctx context.Context, data net.Buffers, timer *time.
   tLogger.PushPrefix(idLStr)
   logger.PushPrefix(idLStr)
 
-  resCh := make(chan []byte)
+  resCh := make(chan []byte, 1)
   seq := c.addChan(resCh)
   defer func() {
     if err != nil {
@@ -355,10 +353,10 @@ func (c *Transport) OnReceived(data []byte) {
 
   rc, ok := c.delChan(seq)
   if !ok {
-    if c.opt.unknownSeq == nil {
+    if c.Delegate == nil {
       logger.Warning(fmt.Sprintf("not find request of reqid(%d)", seq))
     } else {
-      c.opt.unknownSeq(seq, data[4:])
+      c.Delegate.UnknownSeq(seq, data[4:])
     }
     return
   }

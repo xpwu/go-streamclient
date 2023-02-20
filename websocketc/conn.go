@@ -26,18 +26,6 @@ type conn struct {
   maxBytes   uint32
 }
 
-//func newConn(ctx context.Context, c *websocket.Conn) *conn {
-//
-//  ret := &conn{
-//    c:  c,
-//    mu: make(chan struct{}, 1),
-//    id: connid.New(),
-//  }
-//  ret.ctx, ret.cancelF = context.WithCancel(ctx)
-//
-//  return ret
-//}
-
 func newConn(ctx context.Context, c *websocket.Conn) *conn {
   id := connid.Id(0)
   underConn, ok := c.UnderlyingConn().(*xtcp.Conn)
