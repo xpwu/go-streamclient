@@ -63,7 +63,7 @@ func (c *conn) read() {
         break
       }
 
-      c.delegate.OnReceived([]byte{byte(res.State)})
+      c.delegate.OnReceived(append(res.R.Sequence, byte(res.State)))
     }
   }()
 }

@@ -64,7 +64,7 @@ func request(data []byte, token string, subP byte) net.Buffers {
   buffer[0] = []byte(token)
   buffer[1] = make([]byte, 5)
   buffer[1][0] = subP
-  binary.BigEndian.PutUint32(buffer[2][1:], uint32(len(data)))
+  binary.BigEndian.PutUint32(buffer[1][1:], uint32(len(data)))
   buffer[2] = data
 
   return buffer
